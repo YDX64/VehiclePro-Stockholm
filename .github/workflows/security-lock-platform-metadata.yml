@@ -1,0 +1,112 @@
+name: Preserve verified native lock metadata
+"on":
+  push:
+    branches: ['dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4']
+    paths: ['.github/workflows/security-lock-platform-metadata.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Restore only unchanged native packages' original libc selectors
+        run: |
+          python3 - <<'PY'
+          import json,subprocess,hashlib,os
+          from pathlib import Path
+          p=Path('yenisi/package-lock.json')
+          current=json.loads(p.read_text())
+          baseline=json.loads(subprocess.check_output(['git','show','3bb7921dab6a415a7b7166959f68044320710625:yenisi/package-lock.json'],text=True))
+          changed=0
+          for name,old in baseline['packages'].items():
+              new=current['packages'].get(name)
+              if new and 'libc' in old and new.get('version')==old.get('version'):
+                  if new.get('libc') != old['libc']:
+                      new['libc']=old['libc']; changed+=1
+          assert changed>0, 'No missing platform metadata; no patch needed'
+          p.write_text(json.dumps(current,ensure_ascii=False,indent=2)+'\n')
+          Path(os.environ['RUNNER_TEMP'],'lock.sha256').write_text(hashlib.sha256(p.read_bytes()).hexdigest())
+          print(f'Restored platform metadata for {changed} unchanged package versions.')
+          PY
+      - name: Clean install, all-severity audit, production build and type check
+        working-directory: yenisi
+        run: |
+          npm ci --no-audit --no-fund
+          npm audit --audit-level=low
+          npm run build
+          npm exec --no -- tsc --noEmit
+      - name: Export only the exact tested lockfile
+        run: |
+          python3 - <<'PY'
+          import hashlib,os,subprocess
+          from pathlib import Path
+          assert hashlib.sha256(Path('yenisi/package-lock.json').read_bytes()).hexdigest()==Path(os.environ['RUNNER_TEMP'],'lock.sha256').read_text()
+          changed=set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines())
+          assert changed <= {'yenisi/package-lock.json','yenisi/tsconfig.tsbuildinfo'}
+          Path('verified-patch').mkdir()
+          Path('verified-patch/platform-metadata.patch').write_bytes(subprocess.check_output(['git','diff','--','yenisi/package-lock.json']))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-platform-metadata
+          path: verified-patch/platform-metadata.patch
+          retention-days: 14
+          if-no-files-found: error
+  publish:
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-platform-metadata
+          path: verified-patch
+      - name: Apply and independently verify metadata-only scope
+        run: |
+          git apply --check verified-patch/platform-metadata.patch
+          git apply verified-patch/platform-metadata.patch
+          python3 - <<'PY'
+          import json,subprocess
+          from pathlib import Path
+          path='yenisi/package-lock.json'
+          assert subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()==[path]
+          old=json.loads(subprocess.check_output(['git','show','HEAD:'+path],text=True))
+          new=json.loads(Path(path).read_text())
+          baseline=json.loads(subprocess.check_output(['git','show','3bb7921dab6a415a7b7166959f68044320710625:'+path],text=True))
+          for name,item in old['packages'].items():
+              original=baseline['packages'].get(name,{})
+              if 'libc' in original and item.get('version')==original.get('version'):
+                  item['libc']=original['libc']
+          assert old==new, 'Unexpected package or lock changes'
+          PY
+      - name: Push verified metadata without overwriting concurrent work
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.sha }}
+          TARGET_BRANCH: dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4
+        run: |
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          CURRENT=$(git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)
+          test "$CURRENT" = "$EXPECTED_HEAD" || { echo 'Branch advanced; preserve new work and stop.'; exit 1; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- yenisi/package-lock.json
+          git commit -m 'fix(lock): preserve original libc selectors for unchanged native packages'
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          git rev-parse HEAD

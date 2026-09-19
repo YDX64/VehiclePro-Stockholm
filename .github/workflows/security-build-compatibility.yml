@@ -1,0 +1,193 @@
+name: Prepare verified build compatibility patch
+"on":
+  push:
+    branches: ['dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4']
+    paths: ['.github/workflows/security-build-compatibility.yml']
+permissions:
+  contents: read
+jobs:
+  prepare-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Repair unused callback argument without changing rendered content
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('yenisi/src/components/Contact.tsx')
+          text = p.read_text()
+          old = 'contactCards.map((card, index) => ('
+          assert text.count(old) == 1, 'Source changed; review instead of applying blindly'
+          p.write_text(text.replace(old, 'contactCards.map((card) => ('))
+          PY
+      - name: Keep the existing Tailwind 3 styling and browser compatibility contract
+        working-directory: yenisi
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund --save-dev --save-exact tailwindcss@3.4.19
+      - name: Snapshot the exact prepared source and dependency lock
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          paths = ['yenisi/package.json', 'yenisi/package-lock.json', 'yenisi/src/components/Contact.tsx']
+          hashes = {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths}
+          Path(os.environ['RUNNER_TEMP'], 'prepared-hashes.json').write_text(json.dumps(hashes))
+          PY
+      - name: Clean locked installation
+        working-directory: yenisi
+        run: npm ci --no-audit --no-fund
+      - name: Audit all dependency severities
+        working-directory: yenisi
+        run: npm audit --audit-level=low
+      - name: Production build and independent TypeScript validation
+        working-directory: yenisi
+        run: |
+          npm run build
+          npm exec --no -- tsc --noEmit
+      - name: Validate generated CSS and browser-query behavior
+        working-directory: yenisi
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import browserslist from 'browserslist';
+          const css = fs.readdirSync('dist/assets').filter(p => p.endsWith('.css')).map(p => fs.readFileSync(`dist/assets/${p}`, 'utf8')).join('\n');
+          assert(css.includes('.text-swedish-blue'), 'Brand-color utility missing');
+          assert(css.includes('.bg-gray-50'), 'Existing layout styling missing');
+          assert(css.includes('grid-template-columns:repeat(2'), 'Desktop two-column layout missing');
+          assert(!/@tailwind\s/.test(css), 'Uncompiled Tailwind directives');
+          const before = Object.getOwnPropertyDescriptors(Object.prototype);
+          assert.equal(browserslist('last 2 Chrome versions').length, 2);
+          assert.deepEqual(Object.getOwnPropertyDescriptors(Object.prototype), before);
+          console.log('CSS and Browserslist regression checks passed.');
+          JS
+      - name: Check the separate PHP entry point without executing it
+        run: php -l php-version/index.php
+      - name: Install browser test tooling outside the application workspace
+        run: |
+          npm install --prefix "$RUNNER_TEMP/browser-probe" --ignore-scripts --no-audit --no-fund --save-exact playwright
+          node "$RUNNER_TEMP/browser-probe/node_modules/playwright/cli.js" install --with-deps chromium
+      - name: Browser smoke test against localhost only at mobile and desktop widths
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createRequire } from 'node:module';
+          import { spawn } from 'node:child_process';
+          const require = createRequire(`${process.env.RUNNER_TEMP}/browser-probe/package.json`);
+          const { chromium } = require('playwright');
+          const server = spawn('npm', ['run', 'preview', '--', '--host', '127.0.0.1', '--port', '4173', '--strictPort'], {cwd:'yenisi', stdio:'ignore'});
+          let browser;
+          try {
+            let ready = false;
+            for (let i=0; i<60; i++) {
+              try { ready = (await fetch('http://127.0.0.1:4173')).ok; } catch {}
+              if (ready) break;
+              await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            assert(ready, 'Local preview failed to start');
+            browser = await chromium.launch();
+            for (const width of [375, 1280]) {
+              const page = await browser.newPage({viewport:{width,height:900}});
+              const errors = [];
+              page.on('pageerror', error => errors.push(error.message));
+              await page.route('**/*', route => new URL(route.request().url()).origin === 'http://127.0.0.1:4173' ? route.continue() : route.abort());
+              const response = await page.goto('http://127.0.0.1:4173', {waitUntil:'networkidle'});
+              assert.equal(response.status(), 200);
+              const heading = page.getByRole('heading', {name:'Kontakta oss',exact:true});
+              await heading.scrollIntoViewIfNeeded();
+              assert.equal(await heading.evaluate(el => getComputedStyle(el).color), 'rgb(0, 106, 167)');
+              assert.equal(await page.locator('#kontakt select option').count(), 4);
+              await page.locator('#name').fill('Security regression test');
+              await page.locator('#email').fill('test@example.invalid');
+              assert.equal(await page.locator('#name').inputValue(), 'Security regression test');
+              const columns = await page.locator('#kontakt .grid').evaluate(el => getComputedStyle(el).gridTemplateColumns.trim().split(/\s+/).length);
+              assert.equal(columns, width >= 1024 ? 2 : 1);
+              assert.deepEqual(errors, [], 'Browser runtime error');
+              await page.close();
+            }
+            console.log('Mobile/desktop brand colors, contact fields and responsive layout passed; no form submitted or external service contacted.');
+          } finally {
+            if (browser) await browser.close();
+            server.kill('SIGTERM');
+          }
+          JS
+      - name: Export only the exact tested patch
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          hashes = json.loads(Path(os.environ['RUNNER_TEMP'], 'prepared-hashes.json').read_text())
+          for p, expected in hashes.items():
+              assert hashlib.sha256(Path(p).read_bytes()).hexdigest() == expected, f'Tested source changed: {p}'
+          allowed = set(hashes)
+          changed = set(subprocess.check_output(['git','diff','--name-only'], text=True).splitlines())
+          # This tracked compiler cache is regenerated by tsc -b. Preserve it in Git;
+          # do not reset, delete, or include it in the published source/lock patch.
+          generated = {'yenisi/tsconfig.tsbuildinfo'}
+          assert changed <= allowed | generated, f'Unexpected tracked changes: {changed - allowed - generated}'
+          if changed & generated:
+              print('Generated TypeScript cache excluded from the source/lock patch.')
+          patch = subprocess.check_output(['git','diff','--binary','--',*sorted(allowed)])
+          assert patch
+          Path('verified-patch').mkdir()
+          Path('verified-patch/build-compatibility.patch').write_bytes(patch)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-build-compatibility
+          path: verified-patch/build-compatibility.patch
+          retention-days: 14
+          if-no-files-found: error
+  publish-verified-patch:
+    needs: prepare-and-verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-build-compatibility
+          path: verified-patch
+      - name: Apply reviewed-path patch and verify scope without executing application code
+        run: |
+          git apply --check verified-patch/build-compatibility.patch
+          git apply verified-patch/build-compatibility.patch
+          python3 - <<'PY'
+          import json, subprocess
+          from pathlib import Path
+          allowed = {'yenisi/package.json','yenisi/package-lock.json','yenisi/src/components/Contact.tsx'}
+          changed = set(subprocess.check_output(['git','diff','--name-only'], text=True).splitlines())
+          assert changed == allowed, f'Unexpected patch scope: {changed}'
+          before = json.loads(subprocess.check_output(['git','show','HEAD:yenisi/package.json'], text=True))
+          after = json.loads(Path('yenisi/package.json').read_text())
+          before['devDependencies']['tailwindcss'] = '3.4.19'
+          assert before == after, 'Unexpected manifest changes'
+          old = subprocess.check_output(['git','show','HEAD:yenisi/src/components/Contact.tsx'], text=True)
+          assert Path('yenisi/src/components/Contact.tsx').read_text() == old.replace('contactCards.map((card, index) => (','contactCards.map((card) => (')
+          PY
+      - name: Commit and push only if nobody changed the branch during verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ github.sha }}
+          TARGET_BRANCH: dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4
+        run: |
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          CURRENT=$(git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)
+          test "$CURRENT" = "$EXPECTED_HEAD" || { echo 'Branch advanced; preserve new work and stop.'; exit 1; }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- yenisi/package.json yenisi/package-lock.json yenisi/src/components/Contact.tsx
+          git commit -m 'fix(security): preserve Tailwind styling and remove build blocker'
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          git rev-parse HEAD
