@@ -79,7 +79,7 @@ export default function Contact() {
             transition={{ duration: 0.8 }}
             className="space-y-8"
           >
-            {contactCards.map((card, index) => (
+            {contactCards.map((card) => (
               <div key={card.title} className="bg-white p-8 rounded-xl shadow-sm hover:shadow-md transition-shadow">
                 <div className="flex items-center space-x-4 mb-6">
                   <Phone className="h-8 w-8 text-swedish-blue" />
