@@ -1,0 +1,76 @@
+name: Read-only Dependabot snapshot
+"on":
+  push:
+    paths: ['.github/workflows/security-alert-snapshot.yml', '**/package.json', '**/package-lock.json', '**/requirements*.txt', '**/requirements.lock', '**/composer.lock', '**/yarn.lock', '**/pnpm-lock.yaml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  vulnerability-alerts: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read default-branch alert counts without executing application code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import collections, datetime, json, os, re, urllib.error, urllib.parse, urllib.request
+          from pathlib import Path
+          repository=os.environ['REPOSITORY']
+          assert re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+',repository)
+          prefix='/repos/'+repository
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs):
+                  raise RuntimeError('Unexpected API redirect refused')
+          opener=urllib.request.build_opener(NoRedirect())
+          def get(path,stage):
+              assert path.startswith(prefix)
+              request=urllib.request.Request('https://api.github.com'+path,headers={'Accept':'application/vnd.github+json','Authorization':'Bearer '+os.environ['GH_TOKEN'],'X-GitHub-Api-Version':'2026-03-10','User-Agent':'awa-security-read-only-verification'},method='GET')
+              try:
+                  with opener.open(request,timeout=30) as response:
+                      return json.load(response),response.headers.get('Link','')
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f'GitHub {stage} read failed with HTTP {error.code}; no count is asserted.') from None
+          metadata,_=get(prefix,'repository metadata')
+          branch=metadata['default_branch']
+          ref_path=prefix+'/git/ref/heads/'+urllib.parse.quote(branch,safe='')
+          reference,_=get(ref_path,'default branch')
+          head=reference['object']['sha']
+          alerts=[]
+          endpoint=prefix+'/dependabot/alerts'
+          path=endpoint+'?state=open&per_page=100'
+          visited=set()
+          while path:
+              assert path not in visited and len(visited)<100, 'Invalid pagination; no complete count is asserted'
+              visited.add(path)
+              batch,links=get(path,'Dependabot alerts')
+              assert isinstance(batch,list) and all(a.get('state')=='open' for a in batch), 'Invalid alert response'
+              alerts.extend(batch)
+              path=None
+              for url,relation in re.findall(r'<([^>]+)>;\s*rel="([^"]+)"',links):
+                  if 'next' not in relation.split(): continue
+                  parsed=urllib.parse.urlsplit(url)
+                  assert parsed.scheme=='https' and parsed.netloc=='api.github.com' and parsed.path==endpoint and not parsed.fragment, 'Untrusted pagination URL refused'
+                  assert urllib.parse.parse_qs(parsed.query).get('state')==['open'], 'Pagination changed alert state'
+                  path=parsed.path+'?'+parsed.query
+          numbers=[a['number'] for a in alerts]
+          assert len(numbers)==len(set(numbers)), 'Alert pages changed during collection'
+          final_reference,_=get(ref_path,'default branch recheck')
+          assert final_reference['object']['sha']==head, 'Default branch advanced; repeat the read'
+          severity=collections.Counter((a.get('security_advisory') or {}).get('severity','unknown') for a in alerts)
+          ecosystems=collections.Counter(a['dependency']['package']['ecosystem'] for a in alerts)
+          report={'repository':repository,'checked_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':'GitHub REST Dependabot alerts, state=open, complete cursor pagination','api_version':'2026-03-10','default_branch':branch,'default_head':head,'open_alert_count':len(alerts),'severity':{k:severity.get(k,0) for k in ['critical','high','medium','low','unknown']},'ecosystems':dict(sorted(ecosystems.items())),'read_only':True,'limitations':'Reported default-branch alert state, not source-code or deployed-runtime certification. Dependency graph processing can be asynchronous.'}
+          Path('security-alert-snapshot.json').write_text(json.dumps(report,indent=2)+'\n')
+          print('SECURITY_ALERT_SNAPSHOT='+json.dumps(report,sort_keys=True))
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as output:
+              output.write(f"## Default-branch Dependabot snapshot\n\nRepository: `{repository}`\n\nHead: `{head}`\n\nOpen alerts: **{len(alerts)}**\n\nChecked: {report['checked_at_utc']}\n\nRead-only observation; no alerts, settings or deployments changed.\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: dependabot-default-branch-snapshot
+          path: security-alert-snapshot.json
+          retention-days: 30
+          if-no-files-found: error
