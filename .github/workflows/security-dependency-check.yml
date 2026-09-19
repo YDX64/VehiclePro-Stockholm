@@ -1,7 +1,5 @@
 name: Security dependency verification
 "on":
-  push:
-    branches: ['dependabot/npm_and_yarn/yenisi/npm_and_yarn-a5e5b913b4']
   pull_request:
   workflow_dispatch:
 permissions:
@@ -43,11 +41,27 @@ jobs:
           console.log('Browserslist query and prototype-preservation regression checks passed.');
           JS
       - name: Build production application
+        id: build
         if: always() && steps.install.outcome == 'success'
         run: npm run build
       - name: Independent TypeScript check
         if: always() && steps.install.outcome == 'success'
         run: npm exec --no -- tsc --noEmit
+      - name: Verify compiled brand colors and responsive styles
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          const css=fs.readdirSync('dist/assets').filter(p=>p.endsWith('.css')).map(p=>fs.readFileSync(`dist/assets/${p}`,'utf8')).join('\n');
+          assert(css.includes('.text-swedish-blue'));
+          assert(css.includes('.bg-gray-50'));
+          assert(css.includes('grid-template-columns:repeat(2'));
+          assert(!/@tailwind\s/.test(css));
+          console.log('Compiled brand and responsive style checks passed.');
+          JS
+      - name: Check separate PHP entry point syntax without executing it
+        run: php -l ../php-version/index.php
       - name: Ensure dependency lock and manifest did not drift
         if: always() && steps.install.outcome == 'success'
         run: git diff --exit-code -- package-lock.json package.json
